@@ -17,7 +17,6 @@ from core.handle.textHandle import handleTextMessage
 from core.utils.util import (
     get_string_no_punctuation_or_emoji,
     extract_json_from_string,
-    get_ip_info,
     initialize_modules,
 )
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
@@ -30,6 +29,7 @@ from core.mcp.manager import MCPManager
 from config.config_loader import get_private_config_from_api
 from config.manage_api_client import DeviceNotFoundException, DeviceBindException
 from core.utils.output_counter import add_device_output
+from core.handle.ttsReportHandle import enqueue_tts_report, report_tts
 
 TAG = __name__
 
@@ -42,17 +42,28 @@ class TTSException(RuntimeError):
 
 class ConnectionHandler:
     def __init__(
-        self, config: Dict[str, Any], _vad, _asr, _llm, _tts, _memory, _intent
+        self,
+        config: Dict[str, Any],
+        _vad,
+        _asr,
+        _llm,
+        _tts,
+        _memory,
+        _intent,
+        server=None,
     ):
-        self.config = copy.deepcopy(config)
+        self.config = config
+        self.server = server
         self.logger = setup_logging()
         self.auth = AuthMiddleware(config)
 
         self.need_bind = False
         self.bind_code = None
+        self.read_config_from_api = self.config.get("read_config_from_api", False)
 
         self.websocket = None
         self.headers = None
+        self.device_id = None
         self.client_ip = None
         self.client_ip_info = {}
         self.session_id = None
@@ -70,6 +81,10 @@ class ConnectionHandler:
         self.tts_queue = queue.Queue()
         self.audio_play_queue = queue.Queue()
         self.executor = ThreadPoolExecutor(max_workers=10)
+
+        # 上报线程
+        self.tts_report_queue = queue.Queue()
+        self.tts_report_thread = None
 
         # 依赖的组件
         self.vad = _vad
@@ -152,6 +167,7 @@ class ConnectionHandler:
 
             # 认证通过,继续处理
             self.websocket = ws
+            self.device_id = self.headers.get("device-id", None)
             self.session_id = str(uuid.uuid4())
 
             # 启动超时检查任务
@@ -202,12 +218,16 @@ class ConnectionHandler:
         finally:
             await self.close(ws)
 
+    async def reset_timeout(self):
+        """重置超时计时器"""
+        if self.timeout_task:
+            self.timeout_task.cancel()
+        self.timeout_task = asyncio.create_task(self._check_timeout())
+
     async def _route_message(self, message):
         """消息路由"""
         # 重置超时计时器
-        if self.timeout_task:
-            self.timeout_task.cancel()
-            self.timeout_task = asyncio.create_task(self._check_timeout())
+        await self.reset_timeout()
 
         if isinstance(message, str):
             await handleTextMessage(self, message)
@@ -216,27 +236,71 @@ class ConnectionHandler:
 
     async def handle_config_update(self, message):
         """处理配置更新请求"""
-        config_model = message.get("model")
-        new_content = message.get("content")
+        content = message.get("content", {})
+        new_config = content
 
-        # 打印更新前的配置
-        old_value = self.config.get(config_model)
-        self.logger.bind(tag=TAG).info(f"配置更新: {config_model} 从 {old_value} 更新为 {new_content}")
+        # 遍历所有支持的配置模块
+        updated_modules = []
+        for config_model in ["tts", "llm", "vad", "asr", "memory", "intent"]:
+            if config_model not in new_config:
+                continue
 
-        # 更新配置
-        self.config[config_model] = new_content
+            new_content = new_config[config_model]
+            old_content = self.config.get(config_model, {})
 
-        # 如果是模型相关配置，重新初始化模型
-        if config_model in ["LLM", "TTS", "ASR", "VAD", "Intent", "Memory"]:
-            self._initialize_components(self.config)
-            self.logger.bind(tag=TAG).info(f"已使用新配置重新初始化 {config_model} 模块")
+            # 记录配置变更
+            self.logger.bind(tag=TAG).info(
+                f"配置更新: {config_model} 旧值: {json.dumps(old_content, ensure_ascii=False)} "
+                f"新值: {json.dumps(new_content, ensure_ascii=False)}"
+            )
 
-        # 返回更新确认
-        await self.websocket.send(json.dumps({
-            "type": "config_update_response",
-            "status": "success",
-            "message": f"{config_model} 配置已更新"
-        }))
+            # 深度合并配置
+            if isinstance(old_content, dict) and isinstance(new_content, dict):
+                merged = {**old_content, **new_content}
+                self.config[config_model] = merged
+            else:
+                self.config[config_model] = new_content
+
+            # 标记需要重新初始化的模块
+            if config_model in ["llm", "tts", "asr", "vad", "intent", "memory"]:
+                updated_modules.append(config_model)
+
+        # 同步更新 WebSocketServer 的配置
+        if self.server:
+            async with self.server.config_lock:  # 使用锁确保线程安全
+                for config_model in updated_modules:
+                    self.server.config[config_model].update(new_config[config_model])
+
+        # 批量初始化模块
+        if updated_modules:
+            try:
+                self._initialize_components(self.config)
+                self.logger.bind(tag=TAG).info(
+                    f"已重新初始化模块: {', '.join(updated_modules)}"
+                )
+            except Exception as e:
+                self.logger.bind(tag=TAG).error(f"模块初始化失败: {str(e)}")
+                await self.websocket.send(
+                    json.dumps(
+                        {
+                            "type": "config_update_response",
+                            "status": "error",
+                            "message": f"模块初始化失败: {str(e)}",
+                        }
+                    )
+                )
+                return
+
+        # 返回成功响应
+        await self.websocket.send(
+            json.dumps(
+                {
+                    "type": "config_update_response",
+                    "status": "success",
+                    "message": f"已更新配置: {', '.join(updated_modules)}",
+                }
+            )
+        )
 
     def _initialize_components(self, private_config):
         """初始化组件"""
@@ -249,11 +313,23 @@ class ConnectionHandler:
         self._initialize_memory()
         """加载意图识别"""
         self._initialize_intent()
+        """初始化上报线程"""
+        self._init_report_threads()
+
+    def _init_report_threads(self):
+        """初始化ASR和TTS上报线程"""
+        if not self.read_config_from_api:
+            return
+        if self.tts_report_thread is None or not self.tts_report_thread.is_alive():
+            self.tts_report_thread = threading.Thread(
+                target=self._tts_report_worker, daemon=True
+            )
+            self.tts_report_thread.start()
+            self.logger.bind(tag=TAG).info("TTS上报线程已启动")
 
     def _initialize_private_config(self):
-        read_config_from_api = self.config.get("read_config_from_api", False)
         """如果是从配置文件获取，则进行二次实例化"""
-        if not read_config_from_api:
+        if not self.read_config_from_api:
             return
         """从接口获取差异化的配置进行二次实例化，非全量重新实例化"""
         try:
@@ -375,8 +451,7 @@ class ConnectionHandler:
 
     def _initialize_memory(self):
         """初始化记忆模块"""
-        device_id = self.headers.get("device-id", None)
-        self.memory.init_memory(device_id, self.llm)
+        self.memory.init_memory(self.device_id, self.llm)
 
     def _initialize_intent(self):
         if (
@@ -810,7 +885,9 @@ class ConnectionHandler:
                             f"TTS生成：文件路径: {tts_file}"
                         )
                         if os.path.exists(tts_file):
-                            opus_datas, duration = self.tts.audio_to_opus_data(tts_file)
+                            opus_datas, _ = self.tts.audio_to_opus_data(tts_file)
+                            # 在这里上报TTS数据（使用文件路径）
+                            enqueue_tts_report(self, 2, text, opus_datas)
                         else:
                             self.logger.bind(tag=TAG).error(
                                 f"TTS出错：文件不存在{tts_file}"
@@ -866,6 +943,33 @@ class ConnectionHandler:
                     f"audio_play_priority priority_thread: {text} {e}"
                 )
 
+    def _tts_report_worker(self):
+        """TTS上报工作线程"""
+
+        while not self.stop_event.is_set():
+            try:
+                # 从队列获取数据，设置超时以便定期检查停止事件
+                item = self.tts_report_queue.get(timeout=1)
+                if item is None:  # 检测毒丸对象
+                    break
+
+                type, text, audio_data = item
+
+                try:
+                    # 执行上报（传入二进制数据）
+                    report_tts(self, type, text, audio_data)
+                except Exception as e:
+                    self.logger.bind(tag=TAG).error(f"TTS上报线程异常: {e}")
+                finally:
+                    # 标记任务完成
+                    self.tts_report_queue.task_done()
+            except queue.Empty:
+                continue
+            except Exception as e:
+                self.logger.bind(tag=TAG).error(f"TTS上报工作线程异常: {e}")
+
+        self.logger.bind(tag=TAG).info("TTS上报线程已退出")
+
     def speak_and_play(self, text, text_index=0):
         if text is None or len(text) <= 0:
             self.logger.bind(tag=TAG).info(f"无需tts转换，query为空，{text}")
@@ -910,6 +1014,9 @@ class ConnectionHandler:
         if self.executor:
             self.executor.shutdown(wait=False, cancel_futures=True)
             self.executor = None
+
+        # 添加毒丸对象到上报队列确保线程退出
+        self.tts_report_queue.put(None)
 
         # 清空任务队列
         self.clear_queues()
