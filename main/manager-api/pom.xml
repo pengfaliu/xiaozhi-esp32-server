@@ -237,6 +237,15 @@
                     <skipTests>true</skipTests>
                 </configuration>
             </plugin>
+            <plugin>
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-compiler-plugin</artifactId>
+            <version>3.11.0</version> <!-- 使用最新版本 -->
+            <configuration>
+                <source>21</source>   <!-- 源代码的 Java 版本 -->
+                <target>21</target>   <!-- 编译后的字节码版本 -->
+            </configuration>
+            </plugin>
         </plugins>
     </build>
 </project>
